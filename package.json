@@ -1,0 +1,27 @@
+{
+  "name": "pi-render-images-tmux",
+  "version": "0.1.0",
+  "description": "Render Pi read-tool images inline inside tmux using Ghostty/Kitty graphics passthrough.",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dantetekanem/pi-render-images-tmux.git"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "tmux",
+    "ghostty",
+    "kitty-graphics"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
