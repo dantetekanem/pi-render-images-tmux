@@ -16,7 +16,7 @@ Then restart Pi or run:
 /reload
 ```
 
-This repository is private, so installation requires GitHub credentials with access to `dantetekanem/pi-render-images-tmux`.
+This repository is public, so no GitHub credentials are required for installation.
 
 ## Try without installing
 
