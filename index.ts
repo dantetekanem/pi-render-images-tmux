@@ -37,6 +37,7 @@ type RenderState = {
   imageId?: number;
   transmittedKey?: string;
   conversionKey?: string;
+  conversionFailedKey?: string;
   converted?: { data: string; mimeType: string } | null;
   converting?: boolean;
 };
@@ -161,20 +162,32 @@ function imageKey(image: ImageBlock): string {
 
 function startConversion(image: ImageBlock, state: RenderState, context: { invalidate: () => void }) {
   const key = imageKey(image);
+  if (state.conversionFailedKey === key) return;
   if (state.converting && state.conversionKey === key) return;
 
+  if (state.conversionKey !== key) {
+    state.converted = null;
+    state.conversionFailedKey = undefined;
+  }
+
   state.conversionKey = key;
-  state.converted = null;
   state.converting = true;
 
   convertToPng(image.data ?? "", image.mimeType ?? "").then((converted) => {
     if (state.conversionKey !== key) return;
-    state.converted = converted;
+    if (converted) {
+      state.converted = converted;
+      state.conversionFailedKey = undefined;
+    } else {
+      state.converted = null;
+      state.conversionFailedKey = key;
+    }
     state.converting = false;
     context.invalidate();
   }).catch(() => {
     if (state.conversionKey !== key) return;
     state.converted = null;
+    state.conversionFailedKey = key;
     state.converting = false;
     context.invalidate();
   });
@@ -184,15 +197,18 @@ function renderTmuxKittyImage(
   result: { content: Array<TextBlock | ImageBlock> },
   options: ToolRenderResultOptions,
   theme: any,
-  context: { state: RenderState; showImages: boolean; invalidate: () => void },
+  context: { state: RenderState; showImages: boolean; executionStarted: boolean; invalidate: () => void },
 ) {
   const image = result.content.find((part): part is ImageBlock => part.type === "image" && Boolean(part.data && part.mimeType));
-  if (!image || options.isPartial || !context.showImages || detectTmuxSupport() !== "kitty") return null;
+  if (!image || options.isPartial || !context.showImages || !context.executionStarted || detectTmuxSupport() !== "kitty") return null;
 
   let imageData = image.data!;
   let mimeType = image.mimeType!;
 
   if (mimeType !== "image/png") {
+    const sourceKey = imageKey(image);
+    if (context.state.conversionFailedKey === sourceKey) return null;
+
     startConversion(image, context.state, context);
     if (!context.state.converted) {
       const note = textBlocksOnly(result);
