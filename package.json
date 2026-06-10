@@ -1,6 +1,6 @@
 {
   "name": "pi-render-images-tmux",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Render Pi read-tool images inline inside tmux using Ghostty/Kitty graphics passthrough.",
   "private": true,
   "license": "MIT",
