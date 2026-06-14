@@ -1,6 +1,6 @@
 import { execSync } from "node:child_process";
-import type { ExtensionAPI, ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
-import { convertToPng, createReadToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { convertToPng } from "@earendil-works/pi-coding-agent";
 import {
   getCellDimensions,
   getImageDimensions,
@@ -10,6 +10,10 @@ import {
 const PLACEHOLDER = "\u{10EEEE}";
 const CHUNK_SIZE = 4096;
 const DEFAULT_MAX_WIDTH_CELLS = 60;
+const MAX_PREVIEW_SOURCE_DIMENSION_PX = 1600;
+const CUSTOM_MESSAGE_TYPE = "pi-render-images-tmux:image-preview";
+const transmittedImages = new Set<string>();
+const imagePreviews = new Map<string, StoredImagePreview>();
 
 const ROW_DIACRITICS = [
   "\u0305", "\u030D", "\u030E", "\u0310", "\u0312",
@@ -33,13 +37,15 @@ const ROW_DIACRITICS = [
 
 type ImageBlock = { type: "image"; data?: string; mimeType?: string };
 type TextBlock = { type: "text"; text?: string };
-type RenderState = {
-  imageId?: number;
-  transmittedKey?: string;
-  conversionKey?: string;
-  conversionFailedKey?: string;
-  converted?: { data: string; mimeType: string } | null;
-  converting?: boolean;
+type StoredImagePreview = {
+  data: string;
+  mimeType: string;
+  imageId: number;
+  note: string;
+};
+
+type TmuxImagePreviewDetails = {
+  previewId: string;
 };
 
 type TmuxSupport = "kitty" | "unsupported";
@@ -160,109 +166,91 @@ function imageKey(image: ImageBlock): string {
   return `${image.mimeType ?? ""}:${image.data?.length ?? 0}:${image.data?.slice(0, 64) ?? ""}`;
 }
 
-function startConversion(image: ImageBlock, state: RenderState, context: { invalidate: () => void }) {
-  const key = imageKey(image);
-  if (state.conversionFailedKey === key) return;
-  if (state.converting && state.conversionKey === key) return;
-
-  if (state.conversionKey !== key) {
-    state.converted = null;
-    state.conversionFailedKey = undefined;
-  }
-
-  state.conversionKey = key;
-  state.converting = true;
-
-  convertToPng(image.data ?? "", image.mimeType ?? "").then((converted) => {
-    if (state.conversionKey !== key) return;
-    if (converted) {
-      state.converted = converted;
-      state.conversionFailedKey = undefined;
-    } else {
-      state.converted = null;
-      state.conversionFailedKey = key;
-    }
-    state.converting = false;
-    context.invalidate();
-  }).catch(() => {
-    if (state.conversionKey !== key) return;
-    state.converted = null;
-    state.conversionFailedKey = key;
-    state.converting = false;
-    context.invalidate();
-  });
+function findRenderableImage(content: unknown): ImageBlock | undefined {
+  if (!Array.isArray(content)) return undefined;
+  return content.find(
+    (part): part is ImageBlock =>
+      Boolean(part && part.type === "image" && part.data && part.mimeType),
+  );
 }
 
-function renderTmuxKittyImage(
-  result: { content: Array<TextBlock | ImageBlock> },
-  options: ToolRenderResultOptions,
-  theme: any,
-  context: { state: RenderState; showImages: boolean; executionStarted: boolean; invalidate: () => void },
-) {
-  const image = result.content.find((part): part is ImageBlock => part.type === "image" && Boolean(part.data && part.mimeType));
-  if (!image || options.isPartial || !context.showImages || !context.executionStarted || detectTmuxSupport() !== "kitty") return null;
+function isTmuxImagePreviewDetails(details: unknown): details is TmuxImagePreviewDetails {
+  return Boolean(
+    details &&
+      typeof details === "object" &&
+      typeof (details as TmuxImagePreviewDetails).previewId === "string",
+  );
+}
 
-  let imageData = image.data!;
-  let mimeType = image.mimeType!;
+function shouldAttemptTmuxPreview(data: string, mimeType: string): boolean {
+  const dimensions = getImageDimensions(data, mimeType);
+  if (!dimensions) return false;
 
-  if (mimeType !== "image/png") {
-    const sourceKey = imageKey(image);
-    if (context.state.conversionFailedKey === sourceKey) return null;
+  // Large screenshots have produced empty Ghostty/tmux placeholder blocks in practice.
+  // If the custom renderer cannot be trusted, emit nothing and let the read tool fallback stand.
+  return Math.max(dimensions.widthPx, dimensions.heightPx) <= MAX_PREVIEW_SOURCE_DIMENSION_PX;
+}
 
-    startConversion(image, context.state, context);
-    if (!context.state.converted) {
-      const note = textBlocksOnly(result);
-      return new Text(`${theme.fg("toolOutput", note)}\n${theme.fg("muted", "[Converting image for terminal preview...]")}`, 0, 0);
-    }
-    imageData = context.state.converted.data;
-    mimeType = context.state.converted.mimeType;
-  }
+function renderTmuxKittyImage(preview: StoredImagePreview, theme: any) {
+  if (preview.mimeType !== "image/png" || detectTmuxSupport() !== "kitty") return null;
+  if (!shouldAttemptTmuxPreview(preview.data, preview.mimeType)) return null;
 
-  if (mimeType !== "image/png") return null;
-
-  const dimensions = getImageDimensions(imageData, mimeType) ?? { widthPx: 800, heightPx: 600 };
+  const dimensions = getImageDimensions(preview.data, preview.mimeType) ?? { widthPx: 800, heightPx: 600 };
   const cellDimensions = getCellDimensions();
   const maxHeightCells = Math.max(1, Math.ceil((DEFAULT_MAX_WIDTH_CELLS * cellDimensions.widthPx) / cellDimensions.heightPx));
   const size = calculateImageCellSize(dimensions, DEFAULT_MAX_WIDTH_CELLS, maxHeightCells, cellDimensions);
 
-  const key = `${imageKey({ ...image, data: imageData, mimeType })}:${size.columns}x${size.rows}`;
-  if (context.state.transmittedKey !== key) {
-    context.state.imageId = context.state.imageId ?? randomImageId();
-    const imageId = context.state.imageId;
-    process.stdout.write(buildDeleteSequence(imageId) + buildTransmitSequence(imageData, imageId, size.columns, size.rows));
-    context.state.transmittedKey = key;
+  const key = `${imageKey({ type: "image", data: preview.data, mimeType: preview.mimeType })}:${size.columns}x${size.rows}:${preview.imageId}`;
+  if (!transmittedImages.has(key)) {
+    process.stdout.write(buildDeleteSequence(preview.imageId) + buildTransmitSequence(preview.data, preview.imageId, size.columns, size.rows));
+    transmittedImages.add(key);
   }
 
-  const imageId = context.state.imageId!;
-  const note = textBlocksOnly(result);
-  const lines = buildPlaceholderLines(imageId, size.columns, size.rows);
-  return new Text(`${theme.fg("toolOutput", note)}\n${lines.join("\n")}`, 0, 0);
+  const lines = buildPlaceholderLines(preview.imageId, size.columns, size.rows);
+  return new Text(`${theme.fg("toolOutput", preview.note)}\n${lines.join("\n")}`, 0, 0);
 }
 
 export default function piRenderImagesTmux(pi: ExtensionAPI) {
-  const cwd = process.cwd();
-  const originalRead = createReadToolDefinition(cwd);
+  pi.registerMessageRenderer(CUSTOM_MESSAGE_TYPE, (message, _options, theme) => {
+    if (!isTmuxImagePreviewDetails(message.details)) return undefined;
 
-  pi.registerTool({
-    name: "read",
-    label: originalRead.label,
-    description: originalRead.description,
-    parameters: originalRead.parameters,
-    promptSnippet: originalRead.promptSnippet,
-    promptGuidelines: originalRead.promptGuidelines,
+    const preview = imagePreviews.get(message.details.previewId);
+    if (!preview) return undefined;
 
-    execute(toolCallId, params, signal, onUpdate, ctx) {
-      return originalRead.execute(toolCallId, params, signal, onUpdate, ctx);
-    },
+    return renderTmuxKittyImage(preview, theme) ?? undefined;
+  });
 
-    renderCall(args, theme, context) {
-      return originalRead.renderCall(args, theme, context);
-    },
+  pi.on("tool_result", async (event) => {
+    if (event.toolName !== "read" || event.isError || detectTmuxSupport() !== "kitty") return;
 
-    renderResult(result, options, theme, context) {
-      const tmuxImage = renderTmuxKittyImage(result, options, theme, context as any);
-      if (tmuxImage) return tmuxImage;
-      return originalRead.renderResult(result, options, theme, context);
-    },
+    const image = findRenderableImage(event.content);
+    if (!image) return;
+
+    let imageData = image.data!;
+    let mimeType = image.mimeType!;
+    if (mimeType !== "image/png") {
+      const converted = await convertToPng(imageData, mimeType);
+      if (!converted || converted.mimeType !== "image/png") return;
+      imageData = converted.data;
+      mimeType = converted.mimeType;
+    }
+
+    if (!shouldAttemptTmuxPreview(imageData, mimeType)) return;
+
+    const note = textBlocksOnly({ content: event.content as Array<TextBlock | ImageBlock> }) || "Read image file";
+    const previewId = `${event.toolCallId}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
+    imagePreviews.set(previewId, {
+      data: imageData,
+      mimeType,
+      imageId: randomImageId(),
+      note,
+    });
+
+    pi.sendMessage({
+      customType: CUSTOM_MESSAGE_TYPE,
+      content: note,
+      display: true,
+      details: { previewId },
+    });
   });
 }
