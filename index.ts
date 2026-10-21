@@ -4,6 +4,7 @@ import { convertToPng } from "@earendil-works/pi-coding-agent";
 import {
   getCellDimensions,
   getImageDimensions,
+  Image,
   Text,
 } from "@earendil-works/pi-tui";
 
@@ -98,7 +99,7 @@ function randomImageId(): number {
   return Math.floor(Math.random() * 0xfffffe) + 1;
 }
 
-function buildTransmitSequence(base64: string, imageId: number, columns: number, rows: number): string {
+function buildTransmitSequence(base64: string, imageId: number, columns: number, rows: number, tmux = true): string {
   const chunks: string[] = [];
   for (let offset = 0; offset < base64.length; offset += CHUNK_SIZE) {
     const chunk = base64.slice(offset, offset + CHUNK_SIZE);
@@ -115,11 +116,12 @@ function buildTransmitSequence(base64: string, imageId: number, columns: number,
     chunks.push(`\x1b_Ga=T,f=100,q=2,U=1,i=${imageId},c=${columns},r=${rows},m=0;\x1b\\`);
   }
 
-  return wrapTmuxPassthrough(chunks.join(""));
+  return tmux ? wrapTmuxPassthrough(chunks.join("")) : chunks.join("");
 }
 
-function buildDeleteSequence(imageId: number): string {
-  return wrapTmuxPassthrough(`\x1b_Ga=d,d=I,i=${imageId},q=2\x1b\\`);
+function buildDeleteSequence(imageId: number, tmux = true): string {
+  const sequence = `\x1b_Ga=d,d=I,i=${imageId},q=2\x1b\\`;
+  return tmux ? wrapTmuxPassthrough(sequence) : sequence;
 }
 
 function calculateImageCellSize(
@@ -210,7 +212,71 @@ function renderTmuxKittyImage(preview: StoredImagePreview, theme: any) {
   return new Text(`${theme.fg("toolOutput", preview.note)}\n${lines.join("\n")}`, 0, 0);
 }
 
+const HERDR_RENDERER = Symbol.for("pi-render-images-tmux:herdr-renderer");
+
+// Pi 1.3 skips overlay composition on native image rows. Herdr's virtual
+// placements instead follow text cells, so covering a cell also covers its image.
+export function installHerdrImageRendering(
+  prototype: Pick<Image, "render"> & { [HERDR_RENDERER]?: () => void } = Image.prototype,
+  write: (text: string) => void = (text) => { process.stdout.write(text); },
+): () => void {
+  prototype[HERDR_RENDERER]?.();
+  const nativeRender = prototype.render;
+  const cache = new WeakMap<object, { id: number; source: string; lines: string[] }>();
+  const ids = new Set<number>();
+  const render: Image["render"] = function (this: Image, width) {
+    const nativeLines = nativeRender.call(this, width);
+    const source = nativeLines.join("\n");
+    const previous = cache.get(this);
+    if (previous?.source === source) return previous.lines;
+
+    const chunks = [...source.matchAll(/\x1b_G([^;]*);([^\x1b]*)\x1b\\/g)];
+    const params = chunks[0]?.[1] ?? "";
+    const columns = Number(/(?:^|,)c=(\d+)/.exec(params)?.[1]);
+    const rows = Number(/(?:^|,)r=(\d+)/.exec(params)?.[1]);
+    const nativeId = Number(/(?:^|,)i=(\d+)/.exec(params)?.[1]);
+    if (!params.includes("a=T") || !columns || !rows || rows > ROW_DIACRITICS.length || !nativeId) {
+      return nativeLines;
+    }
+
+    let id = previous?.id ?? randomImageId();
+    if (!previous) {
+      while (ids.has(id) || id === nativeId) id = (id % 0xfffffe) + 1;
+      ids.add(id);
+    }
+    const data = chunks.map((chunk) => chunk[2]).join("");
+    write(
+      buildDeleteSequence(nativeId, false) + buildDeleteSequence(id, false)
+      + buildTransmitSequence(data, id, columns, rows, false),
+    );
+    const lines = buildPlaceholderLines(id, columns, rows);
+    cache.set(this, { id, source, lines });
+    return lines;
+  };
+  let restored = false;
+  const restore = () => {
+    if (restored) return;
+    restored = true;
+    if (prototype.render === render) prototype.render = nativeRender;
+    if (prototype[HERDR_RENDERER] === restore) delete prototype[HERDR_RENDERER];
+    if (ids.size) write([...ids].map((id) => buildDeleteSequence(id, false)).join(""));
+  };
+  prototype.render = render;
+  prototype[HERDR_RENDERER] = restore;
+  return restore;
+}
+
 export default function piRenderImagesTmux(pi: ExtensionAPI) {
+  let restoreHerdr: (() => void) | undefined;
+  pi.on("session_start", (_event, ctx) => {
+    if (ctx.hasUI && process.env.HERDR_ENV === "1") {
+      restoreHerdr = installHerdrImageRendering();
+    }
+  });
+  pi.on("session_shutdown", () => {
+    restoreHerdr?.();
+  });
+
   pi.registerMessageRenderer(CUSTOM_MESSAGE_TYPE, (message, _options, theme) => {
     if (!isTmuxImagePreviewDetails(message.details)) return undefined;
 
@@ -221,7 +287,7 @@ export default function piRenderImagesTmux(pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", async (event) => {
-    if (event.toolName !== "read" || event.isError || detectTmuxSupport() !== "kitty") return;
+    if (process.env.HERDR_ENV === "1" || event.toolName !== "read" || event.isError || detectTmuxSupport() !== "kitty") return;
 
     const image = findRenderableImage(event.content);
     if (!image) return;
