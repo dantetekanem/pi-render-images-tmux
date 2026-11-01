@@ -34,6 +34,12 @@ read /path/to/image.png
 
 If the outer terminal is Ghostty or kitty and tmux passthrough is enabled, the image renders inline in the tool result.
 
+### Check image support
+
+Run `/image-status` to check the current configuration without sending a test image. It reports Herdr mode or the first unmet tmux prerequisite: outside tmux, a failed probe, disabled passthrough, or missing/unsupported `TERM_PROGRAM`. Failed probes are reported as unknown, not as disabled settings.
+
+The command only reads configuration. It does not change tmux settings, display environment values, or add persistent logs. It probes afresh without changing normal preview detection cached for the session; use `/reload` after configuration changes. Supported configuration does not prove successful rendering.
+
 ## How it works
 
 Inside tmux, Pi's default terminal capability detection disables inline images. This extension uses the same pane-safe approach as `pi-emote`:

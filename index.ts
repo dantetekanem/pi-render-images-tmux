@@ -64,30 +64,39 @@ function run(command: string): string | null {
   }
 }
 
-function tmuxPassthroughEnabled(): boolean {
-  const output = run("tmux show-options -g allow-passthrough");
-  return /allow-passthrough\s+(on|all)/.test(output ?? "");
-}
+const TMUX_STATUS = {
+  outside: "Inactive: outside tmux. This extension leaves native Pi rendering unchanged.",
+  passthroughFailed: "Unknown: tmux passthrough probe failed or returned an unrecognized response. Check that tmux is installed and its server is reachable.",
+  passthroughOff: "Inactive: tmux passthrough is disabled. See the README's required tmux config.",
+  terminalFailed: "Unknown: tmux TERM_PROGRAM probe failed in both session and global environments. Check tmux access and TERM_PROGRAM configuration.",
+  terminalMissing: "Inactive: tmux TERM_PROGRAM is missing or unset. See the README's required tmux config.",
+  terminalUnsupported: "Inactive: tmux outer terminal is unsupported. This extension expects Ghostty or kitty.",
+  supported: "tmux prerequisites are supported: passthrough is enabled and the outer terminal is Ghostty or kitty.",
+};
 
-function tmuxEnvironment(name: string): string | null {
-  const session = run(`tmux show-environment ${name}`);
-  const global = session ? null : run(`tmux show-environment -g ${name}`);
+function probeTmuxSupport(): keyof typeof TMUX_STATUS {
+  const inTmux = Boolean(process.env.TMUX) || (process.env.TERM ?? "").toLowerCase().startsWith("tmux");
+  if (!inTmux) return "outside";
+
+  const passthrough = run("tmux show-options -g allow-passthrough");
+  const setting = /^allow-passthrough\s+(on|all|off)$/.exec(passthrough ?? "")?.[1];
+  if (!setting) return "passthroughFailed";
+  if (setting === "off") return "passthroughOff";
+
+  const session = run("tmux show-environment TERM_PROGRAM");
+  const global = session ? null : run("tmux show-environment -g TERM_PROGRAM");
   const output = session ?? global;
-  const match = output?.match(new RegExp(`^${name}=(.+)$`, "m"));
-  return match?.[1]?.trim() ?? null;
+  if (output === null) return "terminalFailed";
+
+  const termProgram = /^TERM_PROGRAM=(.*)$/m.exec(output)?.[1]?.trim().toLowerCase();
+  if (!termProgram) return "terminalMissing";
+  return termProgram === "ghostty" || termProgram === "kitty" ? "supported" : "terminalUnsupported";
 }
 
 function detectTmuxSupport(): TmuxSupport {
-  if (cachedTmuxSupport) return cachedTmuxSupport;
-
-  const inTmux = Boolean(process.env.TMUX) || (process.env.TERM ?? "").toLowerCase().startsWith("tmux");
-  if (!inTmux || !tmuxPassthroughEnabled()) {
-    cachedTmuxSupport = "unsupported";
-    return cachedTmuxSupport;
+  if (!cachedTmuxSupport) {
+    cachedTmuxSupport = probeTmuxSupport() === "supported" ? "kitty" : "unsupported";
   }
-
-  const termProgram = (tmuxEnvironment("TERM_PROGRAM") ?? "").toLowerCase();
-  cachedTmuxSupport = termProgram === "ghostty" || termProgram === "kitty" ? "kitty" : "unsupported";
   return cachedTmuxSupport;
 }
 
@@ -267,6 +276,19 @@ export function installHerdrImageRendering(
 }
 
 export default function piRenderImagesTmux(pi: ExtensionAPI) {
+  pi.registerCommand("image-status", {
+    description: "Explain image rendering prerequisites without sending an image",
+    handler: async (_args, ctx) => {
+      const status = process.env.HERDR_ENV === "1"
+        ? "Herdr mode: interactive sessions use cell-backed native images; tmux prerequisites do not apply."
+        : TMUX_STATUS[probeTmuxSupport()];
+      ctx.ui.notify(
+        `${status}\nSupported configuration does not prove successful rendering. No test image was sent.\nThis check does not update preview detection cached for the session; use /reload after configuration changes.`,
+        "info",
+      );
+    },
+  });
+
   let restoreHerdr: (() => void) | undefined;
   pi.on("session_start", (_event, ctx) => {
     if (ctx.hasUI && process.env.HERDR_ENV === "1") {
