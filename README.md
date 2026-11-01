@@ -51,11 +51,16 @@ Herdr support activates automatically in interactive sessions with `HERDR_ENV=1`
 
 This is a version-sensitive workaround for Pi's native image-overlay composition: it wraps `Image.render` for the session and restores it on shutdown or reload. It handles Kitty image grids up to 89 rows; other image output keeps Pi's native rendering. No installed Pi files are modified. After updating this extension, run `/reload` and reopen the agent view to check the result in your terminal.
 
-Focused checks (Node with TypeScript stripping):
+Focused checks (tested with Node 26.3.1 and pnpm 11.12.0):
+
+In a fresh checkout, install the optional Pi peers before running the tests. `.npmrc` disables automatic peer installation; this command enables it for this install only, without changing repository configuration or creating a lockfile:
 
 ```bash
+pnpm install --config.auto-install-peers=true --lockfile=false --ignore-scripts
 node --experimental-strip-types --test index.test.ts
 ```
+
+The setup was verified with both Pi peers at 1.4.0. Their wildcard version ranges can resolve newer versions on later installs. Setup and tests should leave `git status --short` empty.
 
 Set `PI_TUI_TEST_MODULE` to the running Pi's `pi-tui/dist/index.js` path to test that version, including its overlay compositor, rather than the locally installed peer dependency.
 
